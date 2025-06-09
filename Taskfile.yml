@@ -1,0 +1,49 @@
+version: '3'
+
+vars:
+  PYTHON_FILES: "src/"
+  SRC_DIR: "src/reverie"
+
+tasks:
+  install:
+    desc: Install dependencies with Poetry
+    cmds:
+      - poetry install --with dev
+
+  run:
+    desc: Run the Claude exporter tool
+    cmds:
+      - poetry run reverie {{.CLI_ARGS}}
+
+  lint:
+    desc: Run linting with ruff
+    cmds:
+      - poetry run ruff check {{.PYTHON_FILES}}
+      - poetry run ruff format --check {{.PYTHON_FILES}}
+
+  format:
+    desc: Format code with ruff
+    cmds:
+      - poetry run ruff check --fix {{.PYTHON_FILES}}
+      - poetry run ruff format {{.PYTHON_FILES}}
+
+  typecheck:
+    desc: Run type checking with mypy
+    cmds:
+      - poetry run mypy {{.SRC_DIR}}
+
+  shell:
+    desc: Start a poetry shell
+    cmds:
+      - poetry shell
+
+  update:deps:
+    desc: Update dependencies
+    cmds:
+      - poetry update
+      - poetry show --outdated
+
+  build:
+    desc: Build distribution packages
+    cmds:
+      - poetry build

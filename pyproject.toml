@@ -1,0 +1,75 @@
+[tool.poetry]
+name = "reverie"
+version = "0.1.0"
+description = "View and export Claude Code conversations"
+authors = ["Jordan Berg <jberg@users.noreply.github.com>"]
+readme = "README.md"
+license = "CC0-1.0"
+repository = "https://github.com/jberg/reverie"
+packages = [{include = "reverie", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+rich = "^13.7.0"
+click = "^8.1.7"
+typing-extensions = "^4.9.0"
+pydantic = "^2.11.5"
+httpx = "^0.25.0"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.1.9"
+mypy = "^1.8.0"
+pytest = "^7.4.4"
+pytest-cov = "^4.1.0"
+pytest-mock = "^3.12.0"
+
+[tool.poetry.scripts]
+reverie = "reverie.__main__:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "ARG", # flake8-unused-arguments
+    "SIM", # flake8-simplify
+]
+ignore = []
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_any_generics = true
+disallow_untyped_calls = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+no_implicit_optional = true
+strict_equality = true
+strict = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
