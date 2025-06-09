@@ -646,7 +646,7 @@ class ConversationPicker:
                 days_diff = (now.date() - timestamp.date()).days
 
                 if days_diff == 0:
-                    updated_text = f"Today {timestamp.strftime("%H:%M")}"
+                    updated_text = f"Today {timestamp.strftime('%H:%M')}"
                 elif days_diff < 7:
                     updated_text = timestamp.strftime("%m/%d %H:%M")
                 else:
