@@ -6,6 +6,7 @@ across all projects with smooth keyboard navigation and instant preview.
 """
 
 import contextlib
+import os
 import sys
 import termios
 import tty
@@ -82,7 +83,6 @@ TABLE_HEADER_CONVERSATIONS = f"{STYLE_BOLD} {COLOR_OFF_WHITE}"
 # Key display styles
 KEY_STYLE = f"{STYLE_BOLD} {COLOR_BRIGHT_ORANGE}"
 QUIT_KEY_STYLE = f"{STYLE_BOLD} {COLOR_WARM_BROWN}"
-SELECT_KEY_STYLE = f"{STYLE_BOLD} {COLOR_BRIGHT_ORANGE}"
 ACTION_TEXT_STYLE = COLOR_OFF_WHITE
 
 # Error styles
@@ -144,7 +144,7 @@ MAX_PROJECTS_VIEWPORT_SIZE = 8  # Max projects to show at once
 KEY_MAPPINGS = {
     "quit": ("q", "\x1b"),
     "help": ("?",),
-    "select": ("\r", "\n"),
+    "print": ("p",),
     "down": ("j", "\x1b[B"),
     "up": ("k", "\x1b[A"),
     "left": ("h", "\x1b[D"),
@@ -153,6 +153,7 @@ KEY_MAPPINGS = {
     "bottom": ("G",),
     "refresh": ("r",),
     "timeframe": ("t", "T"),
+    "claude": ("c",),
 }
 
 # Timeframe options in days (None = all time)
@@ -215,28 +216,67 @@ class ConversationPicker:
             auto_refresh=False,
             screen=True,
         ) as live:
-            while True:
-                key = self._get_key()
-                result = self._handle_keypress(key)
+            try:
+                while True:
+                    key = self._get_key()
+                    result = self._handle_keypress(key)
 
-                if result != "continue":  # Either selection or quit
-                    return result if isinstance(result, ConversationMetadata) else None
+                    # Handle different result types explicitly
+                    if result == "continue":
+                        # Continue the loop
+                        pass
+                    elif result is None:
+                        # User quit
+                        return None
+                    elif isinstance(result, ConversationMetadata):
+                        # User selected a conversation for printing
+                        return result
+                    elif isinstance(result, tuple) and len(result) >= 1:
+                        # Special action (like claude_resume)
+                        action_type = result[0]
 
-                if self.ui_dirty:
-                    live.update(self._build_layout())
-                    live.refresh()
-                    self.ui_dirty = False
+                        if action_type == "claude_resume" and len(result) == 3:
+                            # Exit the Live display cleanly
+                            live.stop()
+                            # Clear any remaining output
+                            self.console.clear()
+                            # Execute claude resume
+                            self._execute_claude_resume(result[1], result[2])
+                            # This should not return, but just in case
+                            return None
+                        else:
+                            # Unknown action type, treat as continue
+                            pass
+                    else:
+                        # Unexpected result type, treat as continue
+                        pass
 
-    def _handle_keypress(self, key: str) -> ConversationMetadata | None | str:
+                    # Update UI if needed
+                    if self.ui_dirty:
+                        live.update(self._build_layout())
+                        live.refresh()
+                        self.ui_dirty = False
+            except KeyboardInterrupt:
+                # Handle Ctrl+C gracefully - stop live display first
+                live.stop()
+                return None
+            except Exception:
+                # Ensure Live display is stopped on any error
+                live.stop()
+                raise
+
+    def _handle_keypress(self, key: str) -> ConversationMetadata | None | str | tuple[str, ...]:
         """Handle keypress and return conversation if selected, None to quit,
-        or 'continue'."""
+        'continue' to keep going, or tuple for special actions."""
         if key in KEY_MAPPINGS["quit"]:
             return None
         elif key in KEY_MAPPINGS["help"]:
             self.show_help = not self.show_help
             self.ui_dirty = True
-        elif key in KEY_MAPPINGS["select"]:
+        elif key in KEY_MAPPINGS["print"]:
             return self._select_current_conversation()
+        elif key in KEY_MAPPINGS["claude"]:
+            return self._prepare_claude_resume()
         elif key in KEY_MAPPINGS["down"]:
             self._move_down()
         elif key in KEY_MAPPINGS["up"]:
@@ -934,8 +974,8 @@ class ConversationPicker:
         hint = Text()
         hint.append("→ ", style=f"{STYLE_BOLD} {COLOR_WARM_BROWN}")
         hint.append("Press ", style=SEPARATOR_STYLE)
-        hint.append("Enter", style=f"{STYLE_BOLD} {COLOR_WARM_BROWN}")
-        hint.append(" to view full conversation", style=SEPARATOR_STYLE)
+        hint.append("p", style=f"{STYLE_BOLD} {COLOR_WARM_BROWN}")
+        hint.append(" to print full conversation", style=SEPARATOR_STYLE)
         content.append(Align.center(hint))
 
         return Group(*content)
@@ -957,8 +997,12 @@ class ConversationPicker:
         help_text.append(" Switch project", style=ACTION_TEXT_STYLE)
         help_text.append("   ")
 
-        help_text.append("⏎", style=SELECT_KEY_STYLE)
-        help_text.append(" Select", style=ACTION_TEXT_STYLE)
+        help_text.append("p", style=KEY_STYLE)
+        help_text.append(" Print", style=ACTION_TEXT_STYLE)
+        help_text.append("   ")
+
+        help_text.append("c", style=KEY_STYLE)
+        help_text.append(" Claude", style=ACTION_TEXT_STYLE)
         help_text.append("   ")
 
         help_text.append("t", style=KEY_STYLE)
@@ -985,9 +1029,12 @@ class ConversationPicker:
         controls.append(" Help", style=ACTION_TEXT_STYLE)
         controls.append("   ")
 
-        # Make select action slightly more prominent
-        controls.append("⏎", style=SELECT_KEY_STYLE)
-        controls.append(" Select", style=f"{STYLE_BOLD} {COLOR_OFF_WHITE}")
+        controls.append("p", style=KEY_STYLE)
+        controls.append(" Print", style=ACTION_TEXT_STYLE)
+        controls.append("   ")
+
+        controls.append("c", style=KEY_STYLE)
+        controls.append(" Claude", style=ACTION_TEXT_STYLE)
         controls.append("   ")
 
         controls.append("q", style=QUIT_KEY_STYLE)
@@ -1005,6 +1052,10 @@ class ConversationPicker:
         try:
             tty.setraw(sys.stdin.fileno())
             key = sys.stdin.read(1)
+
+            # Handle Ctrl+C
+            if key == "\x03":
+                raise KeyboardInterrupt
 
             # Handle escape sequences (arrow keys)
             if key == "\x1b":
@@ -1068,6 +1119,48 @@ class ConversationPicker:
         ):
             return None
         return project.conversations[self.current_conversation_index]
+
+    def _prepare_claude_resume(self) -> tuple[str, ...] | str:
+        """Prepare to resume Claude conversation with selected session."""
+        conv = self._select_current_conversation()
+        if not conv:
+            return "continue"
+
+        # Get the best working directory - prefer the most recent one
+        if conv.working_directories:
+            # Sort directories by path length (longer = more specific)
+            working_dir = max(conv.working_directories, key=len)
+        else:
+            # Fall back to project path
+            working_dir = conv.project_path
+
+        return ("claude_resume", conv.session_id, working_dir)
+
+    def _execute_claude_resume(self, session_id: str, working_dir: str) -> None:
+        """Execute claude --resume command by replacing the current process."""
+        try:
+            # Change to the working directory
+            os.chdir(working_dir)
+
+            # Check if there's a claude binary in the standard location for local installs
+            local_claude_path = os.path.expanduser("~/.claude/local/claude")
+            if os.path.exists(local_claude_path) and os.access(local_claude_path, os.X_OK):
+                # Use the local claude directly
+                os.execv(local_claude_path, [local_claude_path, "--resume", session_id])
+
+            # If not found in the standard location, use execvp to search PATH
+            os.execvp("claude", ["claude", "--resume", session_id])
+
+        except FileNotFoundError:
+            # If claude is not found, print an error
+            self.console.print("\n❌ Error: 'claude' command not found in PATH", style="bold red")
+            self.console.print(
+                "Make sure Claude Code CLI is installed and in your PATH", style="yellow"
+            )
+            sys.exit(1)
+        except Exception as e:
+            self.console.print(f"\n❌ Error executing claude: {e}", style="bold red")
+            sys.exit(1)
 
     def _get_conversation_display_text(
         self, conv: ConversationMetadata, max_length: int = 30
