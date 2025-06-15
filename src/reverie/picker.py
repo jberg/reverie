@@ -1261,6 +1261,17 @@ class ConversationPicker:
         """Apply timeframe filter to all projects."""
         self.projects = filter_projects_by_timeframe(self.all_projects, self.timeframe_days)
 
+        # Additional filter: remove conversations with 0 tokens
+        for project in self.projects:
+            project.conversations = [
+                conv
+                for conv in project.conversations
+                if (conv.total_input_tokens + conv.total_output_tokens) > 0
+            ]
+
+        # Remove projects that have no conversations left after filtering
+        self.projects = [p for p in self.projects if p.conversations]
+
     def _format_tokens(
         self,
         total: int,

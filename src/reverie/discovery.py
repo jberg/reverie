@@ -46,7 +46,8 @@ class TimestampedCostEntry:
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
     model: str | None = None
-    entry_type: str = "assistant"  # "user" or "assistant"
+    entry_type: str = "assistant"
+    entry_uuid: str | None = None
 
 
 class ConversationMetadata:
@@ -90,9 +91,24 @@ class ConversationMetadata:
 
         # Timestamped entries for timeframe filtering
         self.timestamped_entries: list[TimestampedCostEntry] = []
+        self.entry_uuid_to_timestamp: dict[str, datetime] = {}
 
         # Task tool invocations (for parent conversations)
         self.task_invocations: list[TaskInvocation] = []
+
+        # Branching metadata - detect conversations that branched from others
+        self.parent_session_id: str | None = None
+        self.branch_point_uuid: str | None = None
+        self.entry_uuids: set[str] = set()
+        self._shared_uuids_with_parent: set[str] = set()
+
+        # Post-branch metrics (only tokens/costs after branching)
+        self.post_branch_cost_usd: float = 0.0
+        self.post_branch_calculated_cost_usd: float = 0.0
+        self.post_branch_input_tokens: int = 0
+        self.post_branch_output_tokens: int = 0
+        self.post_branch_cache_creation_tokens: int = 0
+        self.post_branch_cache_read_tokens: int = 0
 
     def clone(self) -> "ConversationMetadata":
         """Create a deep copy of this metadata object."""
@@ -118,11 +134,24 @@ class ConversationMetadata:
         new_conv.tool_result_turns = self.tool_result_turns
         new_conv.total_duration_seconds = self.total_duration_seconds
 
+        # Copy branching metadata
+        new_conv.parent_session_id = self.parent_session_id
+        new_conv.branch_point_uuid = self.branch_point_uuid
+        new_conv.post_branch_cost_usd = self.post_branch_cost_usd
+        new_conv.post_branch_calculated_cost_usd = self.post_branch_calculated_cost_usd
+        new_conv.post_branch_input_tokens = self.post_branch_input_tokens
+        new_conv.post_branch_output_tokens = self.post_branch_output_tokens
+        new_conv.post_branch_cache_creation_tokens = self.post_branch_cache_creation_tokens
+        new_conv.post_branch_cache_read_tokens = self.post_branch_cache_read_tokens
+
         # Deep copy collections
         new_conv.models_used = self.models_used.copy()
         new_conv.working_directories = self.working_directories.copy()
         new_conv.timestamped_entries = self.timestamped_entries.copy()
         new_conv.task_invocations = self.task_invocations.copy()
+        new_conv.entry_uuids = self.entry_uuids.copy()
+        new_conv._shared_uuids_with_parent = self._shared_uuids_with_parent.copy()
+        new_conv.entry_uuid_to_timestamp = self.entry_uuid_to_timestamp.copy()
 
         return new_conv
 
@@ -159,27 +188,27 @@ class ProjectMetadata:
 
     @property
     def total_cost_usd(self) -> float:
-        return sum(conv.total_cost_usd for conv in self.conversations)
+        return sum(conv.post_branch_cost_usd for conv in self.conversations)
 
     @property
     def calculated_cost_usd(self) -> float:
-        return sum(conv.calculated_cost_usd for conv in self.conversations)
+        return sum(conv.post_branch_calculated_cost_usd for conv in self.conversations)
 
     @property
     def total_input_tokens(self) -> int:
-        return sum(conv.total_input_tokens for conv in self.conversations)
+        return sum(conv.post_branch_input_tokens for conv in self.conversations)
 
     @property
     def total_output_tokens(self) -> int:
-        return sum(conv.total_output_tokens for conv in self.conversations)
+        return sum(conv.post_branch_output_tokens for conv in self.conversations)
 
     @property
     def total_cache_creation_tokens(self) -> int:
-        return sum(conv.total_cache_creation_input_tokens for conv in self.conversations)
+        return sum(conv.post_branch_cache_creation_tokens for conv in self.conversations)
 
     @property
     def total_cache_read_tokens(self) -> int:
-        return sum(conv.total_cache_read_input_tokens for conv in self.conversations)
+        return sum(conv.post_branch_cache_read_tokens for conv in self.conversations)
 
     @property
     def all_models_used(self) -> set[str]:
@@ -216,6 +245,88 @@ class ProjectMetadata:
 def decode_project_path(encoded_path: str) -> str:
     """Decode Claude's project path encoding (- back to /)."""
     return encoded_path.replace("-", "/")
+
+
+def _calculate_post_branch_metrics(conversations: list[ConversationMetadata]) -> None:
+    """
+    Calculate metrics for only the post-branch portion of branched conversations.
+    Must be called AFTER _detect_conversation_branches.
+    """
+    for conv in conversations:
+        if not conv.parent_session_id or not conv._shared_uuids_with_parent:
+            # Not a branch or no shared UUIDs, use full metrics
+            conv.post_branch_cost_usd = conv.total_cost_usd
+            conv.post_branch_calculated_cost_usd = conv.calculated_cost_usd
+            conv.post_branch_input_tokens = conv.total_input_tokens
+            conv.post_branch_output_tokens = conv.total_output_tokens
+            conv.post_branch_cache_creation_tokens = conv.total_cache_creation_input_tokens
+            conv.post_branch_cache_read_tokens = conv.total_cache_read_input_tokens
+            continue
+
+        # Calculate metrics from only non-shared entries
+        conv.post_branch_cost_usd = 0.0
+        conv.post_branch_calculated_cost_usd = 0.0
+        conv.post_branch_input_tokens = 0
+        conv.post_branch_output_tokens = 0
+        conv.post_branch_cache_creation_tokens = 0
+        conv.post_branch_cache_read_tokens = 0
+
+        for entry in conv.timestamped_entries:
+            # Skip entries that are shared with parent
+            if entry.entry_uuid and entry.entry_uuid in conv._shared_uuids_with_parent:
+                continue
+
+            # This is a post-branch entry, count it
+            conv.post_branch_cost_usd += entry.cost_usd
+            conv.post_branch_calculated_cost_usd += entry.calculated_cost_usd
+            conv.post_branch_input_tokens += entry.input_tokens
+            conv.post_branch_output_tokens += entry.output_tokens
+            conv.post_branch_cache_creation_tokens += entry.cache_creation_tokens
+            conv.post_branch_cache_read_tokens += entry.cache_read_tokens
+
+
+def _detect_conversation_branches(conversations: list[ConversationMetadata]) -> None:
+    """
+    Detect branching relationships between conversations by analyzing UUID overlaps.
+
+    When a conversation is branched in Claude Code, the new conversation file contains
+    all entries from the parent up to the branch point, then continues with new entries.
+    """
+
+    # Sort by timestamp to ensure parents come before children
+    def sort_key(conv: ConversationMetadata) -> datetime:
+        if not conv.first_timestamp:
+            return datetime.min.replace(tzinfo=None)
+        return conv.first_timestamp.replace(tzinfo=None)
+
+    sorted_convs = sorted(conversations, key=sort_key)
+
+    for i, conv in enumerate(sorted_convs):
+        if not conv.entry_uuids:
+            continue
+
+        # Find the parent with the most UUID overlap
+        best_parent = None
+        best_overlap_count = 0
+        best_shared_uuids = set()
+
+        for earlier_conv in sorted_convs[:i]:
+            if not earlier_conv.entry_uuids:
+                continue
+
+            shared_uuids = conv.entry_uuids & earlier_conv.entry_uuids
+            overlap_count = len(shared_uuids)
+
+            # Any UUID overlap means this is a branch
+            if overlap_count > best_overlap_count:
+                best_overlap_count = overlap_count
+                best_parent = earlier_conv
+                best_shared_uuids = shared_uuids
+
+        if best_parent:
+            conv.parent_session_id = best_parent.session_id
+            # Store shared UUIDs for branch point detection
+            conv._shared_uuids_with_parent = best_shared_uuids
 
 
 def _get_fallback_project_info(project_dir: Path) -> dict[str, str]:
@@ -278,6 +389,11 @@ def discover_projects() -> list[ProjectMetadata]:
                 conv.project_name = real_project_name
 
         if project_meta.conversations:  # Only include projects with conversations
+            # Detect branching relationships between conversations
+            _detect_conversation_branches(project_meta.conversations)
+            # Calculate post-branch metrics
+            _calculate_post_branch_metrics(project_meta.conversations)
+
             # Sort conversations by most recent activity (newest first)
             project_meta.conversations.sort(
                 key=lambda c: (
@@ -340,6 +456,12 @@ def _extract_conversation_metadata(conv_meta: ConversationMetadata) -> str | Non
             task_id_to_model: dict[str, str] = {}  # tool_use_id -> model used
             current_model: str | None = None  # Track current model for each entry
 
+            # Track seen message ID + request ID combinations for deduplication
+            seen_message_request_combos = set()
+
+            # Track branching information
+            entry_uuids = set()
+
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
@@ -350,15 +472,7 @@ def _extract_conversation_metadata(conv_meta: ConversationMetadata) -> str | Non
                     entry_count += 1
                     entry_type = data.get("type", "")
 
-                    # Extract real project info from cwd field
-                    if "cwd" in data:
-                        cwd = data["cwd"]
-                        if cwd and cwd != ".":
-                            if real_project_path is None:
-                                real_project_path = cwd
-                            working_directories.add(cwd)
-
-                    # Extract timestamp
+                    # Extract timestamp first
                     timestamp = None
                     if "timestamp" in data:
                         timestamp_str = data["timestamp"]
@@ -369,6 +483,20 @@ def _extract_conversation_metadata(conv_meta: ConversationMetadata) -> str | Non
                             last_timestamp = timestamp
                         except (ValueError, TypeError):
                             timestamp = None
+
+                    # Track UUIDs for overlap detection with other conversations
+                    if "uuid" in data:
+                        entry_uuids.add(data["uuid"])
+                        if timestamp:
+                            conv_meta.entry_uuid_to_timestamp[data["uuid"]] = timestamp
+
+                    # Extract real project info from cwd field
+                    if "cwd" in data:
+                        cwd = data["cwd"]
+                        if cwd and cwd != ".":
+                            if real_project_path is None:
+                                real_project_path = cwd
+                            working_directories.add(cwd)
 
                     if entry_type == "summary" and "summary" in data:
                         summary = data["summary"]
@@ -386,7 +514,9 @@ def _extract_conversation_metadata(conv_meta: ConversationMetadata) -> str | Non
                             entry_timestamp = timestamp or first_timestamp
                             if entry_timestamp:
                                 user_entry = TimestampedCostEntry(
-                                    timestamp=entry_timestamp, entry_type="user"
+                                    timestamp=entry_timestamp,
+                                    entry_type="user",
+                                    entry_uuid=data.get("uuid"),
                                 )
                                 conv_meta.timestamped_entries.append(user_entry)
 
@@ -450,6 +580,20 @@ def _extract_conversation_metadata(conv_meta: ConversationMetadata) -> str | Non
 
                             # Extract detailed token usage
                             if "usage" in message and isinstance(message.get("usage"), dict):
+                                message_id = message.get("id")
+                                request_id = data.get("requestId")
+                                combo_key = None
+                                if message_id and request_id:
+                                    combo_key = f"{message_id}:{request_id}"
+
+                                should_count_tokens = (
+                                    combo_key is None
+                                    or combo_key not in seen_message_request_combos
+                                )
+
+                                if combo_key:
+                                    seen_message_request_combos.add(combo_key)
+
                                 usage_data = message["usage"]
 
                                 input_tokens = usage_data.get("input_tokens", 0)
@@ -457,10 +601,11 @@ def _extract_conversation_metadata(conv_meta: ConversationMetadata) -> str | Non
                                 cache_creation = usage_data.get("cache_creation_input_tokens", 0)
                                 cache_read = usage_data.get("cache_read_input_tokens", 0)
 
-                                total_input_tokens += input_tokens
-                                total_output_tokens += output_tokens
-                                total_cache_creation_tokens += cache_creation or 0
-                                total_cache_read_tokens += cache_read or 0
+                                if should_count_tokens:
+                                    total_input_tokens += input_tokens
+                                    total_output_tokens += output_tokens
+                                    total_cache_creation_tokens += cache_creation or 0
+                                    total_cache_read_tokens += cache_read or 0
 
                                 # Create usage object for cost calculation
                                 usage = TokenUsage(
@@ -479,7 +624,9 @@ def _extract_conversation_metadata(conv_meta: ConversationMetadata) -> str | Non
                                     pricing_fetcher=_pricing_fetcher,
                                     pricing_data=pricing_data,
                                 )
-                                calculated_cost += calc_cost
+
+                                if should_count_tokens:
+                                    calculated_cost += calc_cost
 
                                 # Create timestamped entry for this assistant response
                                 # Use timestamp if available, fallback to first_timestamp
@@ -492,7 +639,7 @@ def _extract_conversation_metadata(conv_meta: ConversationMetadata) -> str | Non
                                     # but no timestamp
                                     entry_timestamp = first_timestamp
 
-                                if entry_timestamp:
+                                if entry_timestamp and should_count_tokens:
                                     assistant_entry = TimestampedCostEntry(
                                         timestamp=entry_timestamp,
                                         cost_usd=data.get("costUSD", 0.0),
@@ -503,6 +650,7 @@ def _extract_conversation_metadata(conv_meta: ConversationMetadata) -> str | Non
                                         cache_read_tokens=cache_read or 0,
                                         model=model,
                                         entry_type="assistant",
+                                        entry_uuid=data.get("uuid"),
                                     )
                                     conv_meta.timestamped_entries.append(assistant_entry)
 
@@ -532,6 +680,9 @@ def _extract_conversation_metadata(conv_meta: ConversationMetadata) -> str | Non
             conv_meta.tool_result_turns = tool_result_turns
             conv_meta.total_duration_seconds = total_duration
             conv_meta.working_directories = working_directories
+
+            # Store UUIDs for branch detection
+            conv_meta.entry_uuids = entry_uuids
 
             # Match Task tool results with invocations (O(1) dictionary lookup)
             if conv_meta.task_invocations and task_results:

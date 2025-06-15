@@ -264,7 +264,7 @@ class ConversationRenderer:
 
     def _format_timestamp(self, timestamp: datetime) -> str:
         """Format timestamp for display."""
-        return timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        return timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
     def _render_task_invocation(self, task: TaskInvocation) -> None:
         """Render a Task tool invocation with its results."""
